@@ -1,0 +1,33 @@
+[package]
+name = "cadcraft"
+description = "CADCraft desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+default-run = "cadcraft"
+
+[lints]
+workspace = true
+
+[dependencies]
+cadcraft-engine = { workspace = true }
+cadcraft-ui-egui = { workspace = true }
+cadcraft-io = { workspace = true }
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links", "persistence"] }
+egui = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd = { workspace = true }
+sys-locale = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }
