@@ -1,0 +1,411 @@
+//! Edit menu: undo/redo, clipboard, selection.
+
+use cadcraft_doc::{Entity, Handle, entity_bounds};
+use cadcraft_geom::{Bounds2, Mat3, Vec2};
+use serde_json::{Value, json};
+
+use super::machines::{SelOutcome, SelectPhase, SelectRun};
+use super::*;
+use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step};
+
+pub fn specs() -> Vec<CommandSpec> {
+    vec![
+        // U undoes the last operation at once (Edit > Undo, Cmd+Z); UNDO asks how many.
+        CommandSpec::new("u", "Undo", run_u).menu(&["Edit", "Undo"]).key("Cmd+Z").params("{}").noundo(),
+        CommandSpec::new("undo", "Undo", run_undo).params("{count?: n}").noundo().interactive(|_| Ok(Box::new(UndoM::default()))),
+        CommandSpec::new("redo", "Redo", run_redo).menu(&["Edit", "Redo"]).key("Cmd+Shift+Z").alias(&["mredo"]).params("{count?: n}").noundo(),
+        CommandSpec::new("cutclip", "Cut", run_cut)
+            .menu(&["Edit", "Cut"])
+            .key("Cmd+X")
+            .params("{handles?}")
+            .interactive(|_| Ok(Box::new(SelectRun::new("cutclip", "CUTCLIP")))),
+        CommandSpec::new("copyclip", "Copy", run_copyclip)
+            .menu(&["Edit", "Copy"])
+            .key("Cmd+C")
+            .params("{handles?}")
+            .noundo()
+            .interactive(|_| Ok(Box::new(SelectRun::new("copyclip", "COPYCLIP")))),
+        CommandSpec::new("copybase", "Copy with Base Point", run_copybase)
+            .menu(&["Edit", "Copy with Base Point"])
+            .key("Cmd+Shift+C")
+            .params("{handles?, base: [x,y]}")
+            .noundo()
+            .interactive(|_| Ok(Box::new(CopyBaseM::default()))),
+        CommandSpec::new("pasteclip", "Paste", run_paste)
+            .menu(&["Edit", "Paste"])
+            .key("Cmd+V")
+            .params("{at?: [x,y]} (where the base point lands; default: the original coordinates)")
+            .enabled(clipboard::has_clip)
+            .interactive(|_| Ok(Box::new(PasteM { mode: PasteMode::Clip }))),
+        CommandSpec::new("pasteblock", "Paste as Block", run_pasteblock)
+            .menu(&["Edit", "Paste as Block"])
+            .key("Cmd+Shift+V")
+            .params("{at?: [x,y]} (insertion point; default: the original coordinates)")
+            .enabled(clipboard::has_clip)
+            .interactive(|_| Ok(Box::new(PasteM { mode: PasteMode::Block }))),
+        CommandSpec::new("pasteorig", "Paste to Original Coordinates", run_pasteorig)
+            .menu(&["Edit", "Paste to Original Coordinates"])
+            .params("{} (only into a drawing other than the one copied from)")
+            .enabled(clipboard::can_paste_orig)
+            .interactive(|_| Ok(Box::new(PasteM { mode: PasteMode::Orig }))),
+        CommandSpec::new("erase.selection", "Clear", run_clear).menu(&["Edit", "Clear"]).key("Delete").enabled(has_selection).params("{}"),
+        CommandSpec::new("selectall", "Select All", run_selectall).menu(&["Edit", "Select All"]).key("Cmd+A").alias(&["ai_selall"]).noundo(),
+        CommandSpec::new("ai_deselect", "Deselect All", run_deselect).params("{}").noundo(),
+        CommandSpec::new("select", "Select", run_select)
+            .params("{handles: [hex]} | {window: [[x,y],[x,y]], crossing?: bool} | {at: [x,y]} | {clear: true} | {add?: bool}")
+            .noundo()
+            .interactive(|_| Ok(Box::new(SelectM::default()))),
+    ]
+}
+
+/// A programmatic undo/redo (`engine.execute`, MCP, control channel, scripts) first ends a running
+/// command the way Esc does, exactly as `Session::start` does for Cmd+Z, the menu or the command
+/// line. Otherwise it would swap the drawing under the command and pop the previous command's step.
+fn end_running_command(s: &mut Session) {
+    if s.running.is_some() {
+        s.cancel();
+    }
+}
+
+fn run_undo(s: &mut Session, p: &Value) -> Result<Value> {
+    end_running_command(s);
+    let n = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1000);
+    let mut labels = Vec::new();
+    for _ in 0..n {
+        match s.undo()? {
+            Some(l) => labels.push(l),
+            None => break,
+        }
+    }
+    if labels.is_empty() {
+        return Ok(json!({ "message": "Everything has been undone" }));
+    }
+    Ok(json!({ "undone": labels, "message": labels.join(", ").to_string() }))
+}
+
+fn run_u(s: &mut Session, _p: &Value) -> Result<Value> {
+    run_undo(s, &json!({}))
+}
+
+/// UNDO at the command line: "Enter the number of operations to undo" (default 1). Its other
+/// options are not available yet; Auto and Control still take their value, so it isn't run as a
+/// command.
+#[derive(Default)]
+struct UndoM {
+    /// Auto or Control was chosen: its value is being asked for.
+    option: Option<&'static str>,
+}
+
+impl Interactive for UndoM {
+    fn name(&self) -> &'static str {
+        "UNDO"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        match self.option {
+            Some("Auto") => Prompt::new("Enter UNDO Auto mode", Accept::TEXT).kw(&["ON", "OFF"]).default("ON"),
+            Some(_) => Prompt::new("Enter an UNDO control option", Accept::TEXT).kw(&["All", "None", "One", "Combine", "Layer"]).default("All"),
+            None => Prompt::new("Enter the number of operations to undo", Accept::NUMBER)
+                .kw(&["Auto", "Control", "BEgin", "End", "Mark", "Back"])
+                .default("1"),
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if let Some(o) = self.option {
+            s.echo(format!("UNDO {o}: not available yet."));
+            return Ok(Step::Done);
+        }
+        let n = match i {
+            Input::Text(t) => {
+                t.trim().parse::<u64>().ok().filter(|n| *n >= 1).ok_or_else(|| EngineError::Other("Requires a positive integer.".into()))?
+            }
+            Input::Enter => 1,
+            Input::Keyword(k) => {
+                match k.as_str() {
+                    "Auto" => self.option = Some("Auto"),
+                    "Control" => self.option = Some("Control"),
+                    _ => {
+                        s.echo(format!("UNDO {k}: not available yet."));
+                        return Ok(Step::Done);
+                    }
+                }
+                return Ok(Step::Continue);
+            }
+            _ => return Ok(Step::Continue),
+        };
+        let r = run_undo(s, &json!({ "count": n }))?;
+        if let Some(m) = r.get("message").and_then(Value::as_str) {
+            s.echo(m.to_string());
+        }
+        Ok(Step::Done)
+    }
+}
+
+fn run_redo(s: &mut Session, p: &Value) -> Result<Value> {
+    end_running_command(s);
+    let n = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1000);
+    let mut labels = Vec::new();
+    for _ in 0..n {
+        match s.redo()? {
+            Some(l) => labels.push(l),
+            None => break,
+        }
+    }
+    Ok(json!({ "redone": labels, "message": if labels.is_empty() { "Nothing to redo".to_string() } else { labels.join(", ") } }))
+}
+
+fn copy_to_clip(s: &mut Session, hs: &[Handle], base: Option<Vec2>) -> Result<usize> {
+    let d = s.doc()?;
+    let ents: Vec<Entity> = hs.iter().filter_map(|h| d.entity(*h).map(|e| (**e).clone())).collect();
+    let b = ents.iter().fold(Bounds2::EMPTY, |acc, e| acc.union(&entity_bounds(d, e, 0)));
+    let base = base.unwrap_or(if b.min.is_finite() { b.min } else { Vec2::ZERO });
+    let n = ents.len();
+    clipboard::copy(s, ents, base)?;
+    Ok(n)
+}
+
+fn run_copyclip(s: &mut Session, p: &Value) -> Result<Value> {
+    let hs = targets(s, p)?;
+    let n = copy_to_clip(s, &hs, None)?;
+    Ok(json!({ "copied": n }))
+}
+
+fn run_copybase(s: &mut Session, p: &Value) -> Result<Value> {
+    let hs = targets(s, p)?;
+    let base = point_param(p, "base");
+    let n = copy_to_clip(s, &hs, base)?;
+    Ok(json!({ "copied": n }))
+}
+
+fn run_cut(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut hs = targets(s, p)?;
+    hs.retain(|h| !super::curves::is_locked(s, *h));
+    let n = copy_to_clip(s, &hs, None)?;
+    let d = s.doc_mut()?;
+    for h in &hs {
+        d.remove_entity(*h);
+    }
+    s.set_selection(Vec::new());
+    Ok(json!({ "cut": n }))
+}
+
+/// Paste the clipboard moved by `offset` (the clipboard brings the layers, styles and blocks its
+/// objects need).
+fn paste(s: &mut Session, offset: Vec2) -> Result<Vec<Handle>> {
+    clipboard::paste(s, &Mat3::translate(offset))
+}
+
+fn run_paste(s: &mut Session, p: &Value) -> Result<Value> {
+    if s.clipboard.is_empty() {
+        return Err(bad("pasteclip", "the clipboard is empty"));
+    }
+    let off = match point_param(p, "at") {
+        Some(at) => at - s.clipboard_base,
+        None => Vec2::ZERO,
+    };
+    let r = paste(s, off)?;
+    Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
+}
+
+fn run_pasteblock(s: &mut Session, p: &Value) -> Result<Value> {
+    let at = point_param(p, "at").unwrap_or(s.clipboard_base);
+    let h = clipboard::paste_block(s, at)?;
+    let block = match s.doc()?.entity(h).map(|e| &e.kind) {
+        Some(cadcraft_doc::EntityKind::Insert(i)) => i.block.clone(),
+        _ => String::new(),
+    };
+    Ok(json!({ "handle": h.hex(), "block": block }))
+}
+
+fn run_pasteorig(s: &mut Session, _p: &Value) -> Result<Value> {
+    let r = paste(s, Vec2::ZERO)?;
+    Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
+}
+
+fn run_clear(s: &mut Session, _p: &Value) -> Result<Value> {
+    let mut hs = s.selection();
+    hs.retain(|h| !super::curves::is_locked(s, *h));
+    let d = s.doc_mut()?;
+    let mut n = 0;
+    for h in hs {
+        if d.remove_entity(h).is_some() {
+            n += 1;
+        }
+    }
+    s.set_selection(Vec::new());
+    Ok(json!({ "erased": n }))
+}
+
+fn run_selectall(s: &mut Session, _p: &Value) -> Result<Value> {
+    let space = s.space();
+    let d = s.doc()?;
+    let hs: Vec<Handle> = d
+        .space(&space)
+        .map(|st| st.iter().filter(|e| d.is_visible(e) && d.layer(&e.common.layer).is_none_or(|l| !l.locked)).map(|e| e.handle).collect())
+        .unwrap_or_default();
+    let n = hs.len();
+    s.set_selection(hs);
+    Ok(json!({ "selected": n }))
+}
+
+fn run_deselect(s: &mut Session, _p: &Value) -> Result<Value> {
+    s.set_selection(Vec::new());
+    Ok(json!({ "selected": 0 }))
+}
+
+fn run_select(s: &mut Session, p: &Value) -> Result<Value> {
+    if bool_or(p, "clear", false) {
+        s.set_selection(Vec::new());
+        return Ok(json!({ "selected": 0 }));
+    }
+    let space = s.space();
+    let add = bool_or(p, "add", false);
+    let picked: Vec<Handle> = if let Some(w) = points_param(p, "window") {
+        let (Some(a), Some(b)) = (w.first(), w.get(1)) else { return Err(bad("select", "window needs 2 corners")) };
+        crate::select::select_window(s.doc()?, &space, Bounds2::new(*a, *b), bool_or(p, "crossing", false))
+    } else if let Some(at) = point_param(p, "at") {
+        let ap = f64_or(p, "aperture", s.pixel_size() * s.settings.pickbox * 1.5);
+        crate::select::pick(s.doc()?, &space, at, ap).into_iter().collect()
+    } else if let Some(f) = points_param(p, "fence") {
+        crate::select::select_fence(s.doc()?, &space, &f)
+    } else {
+        targets(s, p)?
+    };
+    let mut sel = if add { s.selection() } else { Vec::new() };
+    sel.extend(picked);
+    s.set_selection(sel);
+    let sel = s.selection();
+    Ok(json!({ "selected": sel.len(), "handles": sel.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PasteMode {
+    /// PASTECLIP: at an insertion point.
+    Clip,
+    /// PASTEBLOCK: as a block, at an insertion point.
+    Block,
+    /// PASTEORIG: at the original coordinates, without asking.
+    Orig,
+}
+
+struct PasteM {
+    mode: PasteMode,
+}
+
+impl Interactive for PasteM {
+    fn name(&self) -> &'static str {
+        match self.mode {
+            PasteMode::Clip => "PASTECLIP",
+            PasteMode::Block => "PASTEBLOCK",
+            PasteMode::Orig => "PASTEORIG",
+        }
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        if s.clipboard.is_empty() {
+            s.echo("Clipboard is empty.");
+            return Ok(Step::Done);
+        }
+        if self.mode == PasteMode::Orig {
+            paste(s, Vec2::ZERO)?;
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Specify insertion point", Accept::POINT)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match i {
+            Input::Point(p) if self.mode == PasteMode::Block => {
+                clipboard::paste_block(s, p)?;
+                Ok(Step::Done)
+            }
+            Input::Point(p) => {
+                let base = s.clipboard_base;
+                paste(s, p - base)?;
+                Ok(Step::Done)
+            }
+            Input::Enter => Ok(Step::Done),
+            _ => Ok(Step::Continue),
+        }
+    }
+    fn preview(&self, s: &Session, c: Vec2) -> Vec<cadcraft_doc::EntityKind> {
+        let m = Mat3::translate(c - s.clipboard_base);
+        s.clipboard
+            .iter()
+            .take(500)
+            .map(|e| {
+                let mut k = e.kind.clone();
+                k.transform(&m);
+                k
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct SelectM {
+    sel: SelectPhase,
+}
+
+impl Interactive for SelectM {
+    fn name(&self) -> &'static str {
+        "SELECT"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        self.sel.prompt()
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match self.sel.feed(s, &i)? {
+            SelOutcome::More => Ok(Step::Continue),
+            _ => Ok(Step::Done),
+        }
+    }
+}
+
+/// COPYBASE: base point first, then "Select objects:" (skipped with a pickfirst selection).
+#[derive(Default)]
+struct CopyBaseM {
+    base: Option<Vec2>,
+    sel: SelectPhase,
+}
+
+impl CopyBaseM {
+    fn copy(&self, s: &mut Session, hs: &[Handle]) -> Result<Step> {
+        copy_to_clip(s, hs, self.base)?;
+        Ok(Step::Done)
+    }
+}
+
+impl Interactive for CopyBaseM {
+    fn name(&self) -> &'static str {
+        "COPYBASE"
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        self.sel = SelectPhase::begin(s);
+        Ok(Step::Continue)
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if self.base.is_none() { Prompt::new("Specify base point", Accept::POINT) } else { self.sel.prompt() }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if self.base.is_none() {
+            if let Input::Point(p) = i {
+                self.base = Some(p);
+                if self.sel.done {
+                    let hs = self.sel.picked.clone();
+                    return self.copy(s, &hs);
+                }
+            }
+            return Ok(Step::Continue);
+        }
+        match self.sel.feed(s, &i)? {
+            SelOutcome::More => Ok(Step::Continue),
+            SelOutcome::Empty => Ok(Step::Done),
+            SelOutcome::Done(hs) => {
+                let step = self.copy(s, &hs)?;
+                s.set_selection(Vec::new());
+                Ok(step)
+            }
+        }
+    }
+}
